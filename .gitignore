@@ -1,0 +1,3 @@
+# Raw Snowflake pulls — contain customer account names and case numbers.
+# The dashboard HTML is aggregate-only and safe to publish; these are not.
+data/
