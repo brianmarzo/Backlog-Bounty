@@ -5,7 +5,8 @@
 # host and can't reach Snowflake, and the DB credentials should stay on this Mac.
 
 set -u
-cd "$(dirname "$0")" || exit 1
+# ${0:A} resolves symlinks, so the Desktop shortcut lands in the repo, not on the Desktop.
+cd "${0:A:h}" || exit 1
 
 LIVE="https://brianmarzo.github.io/Backlog-Bounty/"
 export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
@@ -34,9 +35,10 @@ printf '        built %s\n' "$(basename "$(printf '%s' "$BUILD" | tail -1)")"
 # rendered page is genuinely aggregate-only before anything goes public.
 printf '  \033[2m2/3\033[0m  Checking no customer data is in the page…\n'
 LEAK=$(python3 - <<'PY' 2>&1
-import json, pathlib, sys
-html = pathlib.Path("index.html").read_text()
-bad = 0
+import json, pathlib
+
+# Every customer identifier that came back in the raw pull.
+ids = set()
 for f in pathlib.Path("data").glob("*.json"):
     try:
         rows = json.loads(f.read_text())
@@ -45,12 +47,17 @@ for f in pathlib.Path("data").glob("*.json"):
     if not isinstance(rows, list):
         continue
     for r in rows:
-        if not isinstance(r, dict):
-            continue
-        for key in ("ACCOUNT_NAME", "CASE_NUMBER"):
-            v = r.get(key)
-            if v and str(v) in html:
-                bad += 1
+        if isinstance(r, dict):
+            for key in ("ACCOUNT_NAME", "CASE_NUMBER"):
+                if r.get(key):
+                    ids.add(str(r[key]))
+
+# Check every page that would be published, not just index.html — the commit
+# picks up all of them.
+bad = 0
+for page in pathlib.Path(".").glob("*.html"):
+    text = page.read_text()
+    bad += sum(1 for i in ids if i in text)
 print(bad)
 PY
 )
