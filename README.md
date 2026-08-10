@@ -2,7 +2,7 @@
 
 Daily leaderboard for the Launch team's August 2026 aging-case spiff.
 
-**→ [View the live dashboard](https://brianmarzo18.github.io/backlog-bounty/)**
+**→ [View the live dashboard](https://brianmarzo.github.io/backlog-bounty/)**
 
 ## The rules
 
