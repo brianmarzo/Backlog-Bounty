@@ -20,7 +20,8 @@ ROOT = Path(__file__).resolve().parent
 DATA = ROOT / "data"
 QUERIES = ROOT / "queries"
 
-QUERY_NAMES = ("bounty_cases", "open_backlog", "cohort_activation", "cohort_case_detail")
+QUERY_NAMES = ("bounty_cases", "open_backlog", "cohort_activation", "cohort_case_detail",
+               "roster")
 
 BOUNTY_END = dt.date(2026, 8, 31)
 
@@ -120,9 +121,15 @@ def build_model():
                 "gold": 0, "silver": 0, "earned": 0, "aug_launches": 0,
                 "open_gold": 0, "open_silver": 0, "available": 0, "churn_risk": 0,
                 "cohort": {}, "assigned_2026": 0, "launched_2026": 0,
-                "open_by_month": defaultdict(int),
+                "open_by_month": defaultdict(int), "on_roster": False,
             }
         return reps[name]
+
+    # Seed from the live roster FIRST so every active rep gets a row even at $0.
+    # Anyone who only shows up in the case data is a departed owner — still counted,
+    # but flagged, because their open cases are real churn liability.
+    for u in load("roster"):
+        slot(u["REP"], u["MANAGER"], u["TITLE"])["on_roster"] = True
 
     for c in cases:
         r = slot(c["REP"], c["MANAGER"], c["TITLE"])
@@ -182,6 +189,42 @@ def case_detail_payload():
         rows.sort(key=lambda r: (r["d"] != "Open",
                                  STATUS_ORDER.index(r["s"]) if r["s"] in STATUS_ORDER else 99,
                                  -r["days"]))
+    return detail
+
+
+def bounty_detail_payload():
+    """Cases behind the money columns, keyed "rep|earned" / "rep|gold" / "rep|silver".
+
+    Managers asked to see the actual cases behind every number, not just the totals —
+    which ones paid out, and exactly which aged cases are still sitting there.
+    """
+    detail = defaultdict(list)
+
+    for c in load("bounty_cases"):
+        if c["MANAGER"] not in POD_DIRECTOR or not c["BOUNTY_USD"]:
+            continue
+        detail[f'{c["REP"]}|earned'].append({
+            "n": c["CASE_NUMBER"], "a": c["ACCOUNT_NAME"] or "—",
+            "m": c["COHORT_MONTH"], "on": c["LAUNCHED_ON"] or "",
+            "days": c["DAYS_IN_ONBOARDING"], "b": c["BOUNTY_USD"],
+        })
+
+    for c in load("open_backlog"):
+        b = c["BOUNTY_IF_LAUNCHED"]
+        if c["MANAGER"] not in POD_DIRECTOR or b not in (20, 40):
+            continue
+        detail[f'{c["REP"]}|{"gold" if b == 40 else "silver"}'].append({
+            "n": c["CASE_NUMBER"], "a": c["ACCOUNT_NAME"] or "—",
+            "m": c["COHORT_MONTH"], "s": c["STATUS"], "days": c["DAYS_OPEN"],
+            "gl": c["GO_LIVE_SCHEDULED"] or "", "cf": c["LAUNCH_CONFIDENCE"] or "",
+            "b": b,
+        })
+
+    for key, rows in detail.items():
+        if key.endswith("|earned"):
+            rows.sort(key=lambda r: (-r["b"], r["on"]))
+        else:
+            rows.sort(key=lambda r: -r["days"])   # oldest first — most at risk
     return detail
 
 
@@ -260,9 +303,11 @@ def fmt_pct(v):
     return f"{v:.0f}%" if v is not None else "—"
 
 
-def target_list(reps, limit=25):
-    ranked = sorted([r for r in reps if r["available"] > 0],
-                    key=lambda r: (-r["open_gold"], -r["available"]))[:limit]
+def target_list(reps):
+    # Every rep gets a row. This used to filter to available > 0 and cap at 25, which
+    # silently dropped reps with no aged inventory and anyone ranked below 25th —
+    # Adam spotted three of his own missing. Pod tabs keep the full list readable.
+    ranked = sorted(reps, key=lambda r: (-r["open_gold"], -r["available"], r["rep"]))
     rows = []
     for r in ranked:
         act = r["cohort"]
@@ -275,14 +320,15 @@ def target_list(reps, limit=25):
             cell = f'<td class="num muted">n/a<span class="sub">{l}/{a} assigned</span></td>'
         else:
             cell = f'<td class="num {act_class(ba)}">{fmt_pct(ba)}<span class="sub">{l}/{a}</span></td>'
+        gone = "" if r.get("on_roster") else '<span class="gone" title="Owns cases but is not on the active roster — someone has to absorb these">departed</span>'
         rows.append(f"""<tr data-pod="{slug(r['manager'])}">
-  <td class="name">{r['rep']}<span class="sub">{r['manager']}</span></td>
-  <td class="num"><span class="chip chip-gold">{r['open_gold']}</span></td>
-  <td class="num"><span class="chip chip-blue">{r['open_silver']}</span></td>
+  <td class="name">{r['rep']}{gone}<span class="sub">{r['manager']}</span></td>
+  <td class="num">{bchip(r, 'gold', 'chip-gold', r['open_gold'])}</td>
+  <td class="num">{bchip(r, 'silver', 'chip-blue', r['open_silver'])}</td>
   <td class="num money-open big">{money(r['available'])}</td>
   <td class="num danger">{r['churn_risk']}</td>
   {cell}
-  <td class="num money-won">{money(r['earned'])}</td>
+  <td class="num money-won">{bmoney(r, 'earned', r['earned'])}</td>
 </tr>""")
     return f"""<table class="tbl">
 <thead><tr><th>Rep</th><th class="num">Open $40<br><span class="sub">Mar &amp; older</span></th>
@@ -292,19 +338,39 @@ def target_list(reps, limit=25):
 <tbody>{''.join(rows)}</tbody></table>"""
 
 
+def bdrill(rep, kind, n):
+    """data-* attributes that make a money cell open its case list."""
+    if not n:
+        return ""
+    return (f' data-rep="{esc(rep)}" data-kind="{kind}" data-n="{n}"'
+            f' title="Click to see the {n} case{"s" if n != 1 else ""}"')
+
+
+def bchip(r, kind, cls, n):
+    d = bdrill(r["rep"], kind, n)
+    inner = f'<span class="chip {cls}">{n or "·"}</span>'
+    return f'<span class="bd"{d}>{inner}</span>' if d else inner
+
+
+def bmoney(r, kind, amount):
+    n = r["gold"] + r["silver"] if kind == "earned" else 0
+    d = bdrill(r["rep"], kind, n)
+    return f'<span class="bd"{d}>{money(amount)}</span>' if d else money(amount)
+
+
 def leaderboard(reps):
     ranked = sorted(reps, key=lambda r: (-r["earned"], -r["gold"], -r["available"], r["rep"]))
-    ranked = [r for r in ranked if r["earned"] or r["available"] or r["aug_launches"]]
     rows = []
     for i, r in enumerate(ranked):
-        medal = {0: "\U0001f947", 1: "\U0001f948", 2: "\U0001f949"}.get(i, "")
+        medal = {0: "\U0001f947", 1: "\U0001f948", 2: "\U0001f949"}.get(i, "") if r["earned"] else ""
+        gone = "" if r.get("on_roster") else '<span class="gone">departed</span>'
         rows.append(f"""<tr data-pod="{slug(r['manager'])}">
   <td class="rank">{medal or i+1}</td>
-  <td class="name">{r['rep']}<span class="sub">{r['manager']}</span></td>
+  <td class="name">{r['rep']}{gone}<span class="sub">{r['manager']}</span></td>
   <td class="num">{r['aug_launches']}</td>
-  <td class="num"><span class="chip chip-gold">{r['gold'] or '·'}</span></td>
-  <td class="num"><span class="chip chip-blue">{r['silver'] or '·'}</span></td>
-  <td class="num money-won big">{money(r['earned'])}</td>
+  <td class="num">{bchip(r, 'earned', 'chip-gold', r['gold'])}</td>
+  <td class="num">{bchip(r, 'earned', 'chip-blue', r['silver'])}</td>
+  <td class="num money-won big">{bmoney(r, 'earned', r['earned'])}</td>
   <td class="num money-open">{money(r['available'])}</td>
 </tr>""")
     return f"""<table class="tbl">
@@ -397,6 +463,7 @@ def render(reps, generated):
     full_month = {"pre-2026": "Pre-2026 cohorts",
                   **{m: f"{MONTH_LABEL[m]} 2026" for m in MONTHS}}
     month_json = json.dumps(full_month, separators=(",", ":"))
+    bounty_json = json.dumps(bounty_detail_payload(), separators=(",", ":")).replace("</", "<\\/")
 
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
@@ -534,6 +601,12 @@ table.matrix td.name.drill:hover {{ color:var(--owner-green); }}
 .tag.live {{ background:rgba(8,137,36,.14); color:#07691c; }}
 .bty {{ font-weight:700; color:#07691c; }}
 .none {{ color:#a8a19a; }}
+/* clickable money / chip cells in the rep tables */
+.bd {{ cursor:pointer; display:inline-block; border-bottom:1.5px dotted rgba(8,137,36,.5); }}
+.bd:hover {{ border-bottom-color:var(--owner-green); transform:translateY(-1px); }}
+.gone {{ display:inline-block; margin-left:7px; font-size:11px; font-weight:700;
+  text-transform:uppercase; letter-spacing:.5px; padding:2px 7px; border-radius:6px;
+  background:rgba(179,64,47,.14); color:#8f3325; vertical-align:middle; }}
 table.matrix th.t40, table.matrix td.t40 {{ background:rgba(221,173,107,.16); }}
 table.matrix th.t20, table.matrix td.t20 {{ background:rgba(86,174,221,.14); }}
 table.matrix td.tot {{ border-left:2px solid var(--warm-gray); font-weight:700; }}
@@ -658,6 +731,7 @@ code {{ background:var(--warm-beige); padding:2px 7px; border-radius:6px; font-s
 <script>
 var DETAIL = {detail_json};
 var MONTHNAME = {month_json};
+var BOUNTY = {bounty_json};
 
 (function () {{
   var modal = document.getElementById('modal');
@@ -741,7 +815,63 @@ var MONTHNAME = {month_json};
     modal.classList.add('open');
   }}
 
+  // ---- money / chip cells in the rep tables -------------------------------
+  var KIND = {{
+    earned: {{ t: 'bounty earned', sub: 'August launches that paid out' }},
+    gold:   {{ t: 'open $40 cases', sub: 'March 2026 and older — still open' }},
+    silver: {{ t: 'open $20 cases', sub: 'April–May 2026 — still open' }}
+  }};
+
+  function openBounty(rep, kind) {{
+    var rows = BOUNTY[rep + '|' + kind] || [], k = KIND[kind];
+    T.textContent = rep + ' · ' + k.t;
+    var money = 0;
+    rows.forEach(function (r) {{ money += r.b; }});
+
+    if (kind === 'earned') {{
+      M.innerHTML = '<b>' + rows.length + '</b> qualifying launch'
+        + (rows.length === 1 ? '' : 'es') + ' · <b>$' + money + '</b> earned';
+      P.innerHTML = '<span class="pill">' + k.sub + '</span>';
+      B.innerHTML = rows.length
+        ? '<table><thead><tr><th>Account</th><th>Cohort</th><th>Launched</th>'
+          + '<th class="num">Days in onboarding</th><th class="num">Paid</th></tr></thead><tbody>'
+          + rows.map(function (r) {{
+              return '<tr><td>' + esc(r.a)
+                + '<div class="sub" style="color:#8a837b;font-size:13px">' + esc(r.n) + '</div></td>'
+                + '<td>' + esc(MONTHNAME[r.m] || r.m) + '</td>'
+                + '<td>' + esc(r.on) + '</td>'
+                + '<td class="num">' + r.days + 'd</td>'
+                + '<td class="num"><span class="bty">$' + r.b + '</span></td></tr>';
+            }}).join('') + '</tbody></table>'
+        : '<p class="none" style="padding:24px 0">No qualifying launches yet.</p>';
+    }} else {{
+      var nosched = rows.filter(function (r) {{ return !r.gl; }}).length;
+      M.innerHTML = '<b>' + rows.length + '</b> open case'
+        + (rows.length === 1 ? '' : 's') + ' · <b>$' + money + '</b> if launched by Aug 31';
+      P.innerHTML = '<span class="pill">' + k.sub + '</span>'
+        + '<span class="pill cancel">' + rows.length + ' force-churn on 8/31 if not launched</span>'
+        + (nosched ? '<span class="pill closed">' + nosched + ' with no go-live date</span>' : '');
+      B.innerHTML = rows.length
+        ? '<table><thead><tr><th>Account</th><th>Status</th><th>Cohort</th><th class="num">Age</th>'
+          + '<th>Go-live scheduled</th><th>Confidence</th><th class="num">Bounty</th></tr></thead><tbody>'
+          + rows.map(function (r) {{
+              return '<tr><td>' + esc(r.a)
+                + '<div class="sub" style="color:#8a837b;font-size:13px">' + esc(r.n) + '</div></td>'
+                + '<td>' + statusTag(r.s) + '</td>'
+                + '<td>' + esc(MONTHNAME[r.m] || r.m) + '</td>'
+                + '<td class="num">' + r.days + 'd</td>'
+                + '<td>' + (r.gl ? esc(r.gl) : '<span class="none">not scheduled</span>') + '</td>'
+                + '<td>' + (r.cf ? esc(r.cf) : '<span class="none">—</span>') + '</td>'
+                + '<td class="num"><span class="bty">$' + r.b + '</span></td></tr>';
+            }}).join('') + '</tbody></table>'
+        : '<p class="none" style="padding:24px 0">Nothing open in this tier.</p>';
+    }}
+    modal.classList.add('open');
+  }}
+
   document.addEventListener('click', function (e) {{
+    var bd = e.target.closest('.bd[data-kind]');
+    if (bd) {{ openBounty(bd.dataset.rep, bd.dataset.kind); return; }}
     var td = e.target.closest('td.drill');
     if (td) {{
       open(td.dataset.rep, td.dataset.month,
