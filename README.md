@@ -24,6 +24,7 @@ So every qualifying open case is simultaneously a payout and a churn liability.
 | `queries/bounty_cases.sql` | August launches, with cohort and bounty value per case. |
 | `queries/open_backlog.sql` | Aged cases still open — the remaining opportunity and churn risk. |
 | `queries/cohort_activation.sql` | Activation rate by assignment-month cohort, per rep. |
+| `queries/cohort_case_detail.sql` | Every non-launched case behind each matrix cell — the drill-down. |
 
 ## Refreshing it
 
@@ -50,5 +51,14 @@ cohorts read low by design while they're still inside a normal launch cycle.
 The seven participating frontline pods: Adam Hubbell, Andrea Novais, Edison Blanco,
 Juan Sanabria, Diego Orjuela, Amada Romero, Santiago Romero.
 
-Raw query output is gitignored — it contains customer account names. The published
-dashboard is aggregate-only.
+## ⚠️ The HTML is no longer aggregate-only
+
+As of the drill-down build (2026-08-10), `index.html` embeds **~3,100 customer account
+names, case numbers, and statuses** so the matrix cells can be opened. Raw query output in
+`data/` is still gitignored, but the HTML itself now carries the same customer data.
+
+**This repo publishes `index.html` to GitHub Pages at a public URL.** Pushing the
+drill-down build puts those restaurant names on the open internet. Decide deliberately
+before `git push`: either make the repo private, or strip account names from the payload
+(`case_detail_payload()` in `build_dashboard.py` — drop the `"a"` key) and publish
+case numbers only.

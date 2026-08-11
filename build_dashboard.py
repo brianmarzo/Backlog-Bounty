@@ -13,12 +13,13 @@ import subprocess
 import datetime as dt
 from pathlib import Path
 from collections import defaultdict
+import html as html_lib
 
 ROOT = Path(__file__).resolve().parent
 DATA = ROOT / "data"
 QUERIES = ROOT / "queries"
 
-QUERY_NAMES = ("bounty_cases", "open_backlog", "cohort_activation")
+QUERY_NAMES = ("bounty_cases", "open_backlog", "cohort_activation", "cohort_case_detail")
 
 BOUNTY_END = dt.date(2026, 8, 31)
 
@@ -65,6 +66,9 @@ def run_queries():
 # Snowflake's JSON output serializes numeric columns as strings.
 INT_COLS = ("BOUNTY_USD", "BOUNTY_IF_LAUNCHED", "ASSIGNED", "LAUNCHED", "STILL_OPEN",
             "CANCELED", "CLOSED_OTHER", "DAYS_IN_ONBOARDING", "DAYS_OPEN")
+# Drill-down statuses, ordered worst-to-best so the modal leads with what needs work.
+STATUS_ORDER = ["Back to Sales", "On Hold", "New", "Launch Accepted",
+                "First Order Completed", "Second Order Completed"]
 FLOAT_COLS = ("ACTIVATION_PCT", "GP_SCORE")
 
 
@@ -132,6 +136,35 @@ def build_model():
     return list(reps.values())
 
 
+def case_detail_payload():
+    """Non-launched cases keyed by "rep|cohort_month", for the matrix drill-down.
+
+    Only the seven participating pods are embedded — the query returns the whole org,
+    and shipping the rest would bloat the page with rows no cell can ever open.
+    """
+    detail = defaultdict(list)
+    for c in load("cohort_case_detail"):
+        if c["MANAGER"] not in POD_DIRECTOR:
+            continue
+        detail[f'{c["REP"]}|{c["COHORT_MONTH"]}'].append({
+            "n": c["CASE_NUMBER"],
+            "a": c["ACCOUNT_NAME"] or "—",
+            "s": c["STATUS"],
+            "d": c["DISPOSITION"],
+            "days": c["DAYS_OPEN"],
+            "gl": c["GO_LIVE_SCHEDULED"] or "",
+            "cf": c["LAUNCH_CONFIDENCE"] or "",
+            "pr": c["PAUSED_REASON"] or "",
+            "b": c["BOUNTY_IF_LAUNCHED"],
+        })
+    for rows in detail.values():
+        # Open cases first (still actionable), then longest-waiting.
+        rows.sort(key=lambda r: (r["d"] != "Open",
+                                 STATUS_ORDER.index(r["s"]) if r["s"] in STATUS_ORDER else 99,
+                                 -r["days"]))
+    return detail
+
+
 def pod_rollup(reps):
     pods = defaultdict(lambda: {
         "earned": 0, "available": 0, "gold": 0, "silver": 0, "churn_risk": 0,
@@ -171,6 +204,10 @@ def act_class(v):
 
 def slug(s):
     return "".join(ch if ch.isalnum() else "-" for ch in s).lower()
+
+
+def esc(s):
+    return html_lib.escape(str(s), quote=True)
 
 
 # ---------------------------------------------------------------- sections
@@ -270,14 +307,22 @@ def activation_matrix(reps):
                 continue
             v = c["ACTIVATION_PCT"]
             tier = "t40" if m in TIER_40 else ("t20" if m in TIER_20 else "")
+            gap = c["ASSIGNED"] - c["LAUNCHED"]
+            # Every cell with a gap opens the list of cases behind it.
+            drill = (f' data-rep="{esc(r["rep"])}" data-month="{m}"'
+                     f' data-launched="{c["LAUNCHED"]}" data-assigned="{c["ASSIGNED"]}"'
+                     if gap else "")
             cells.append(
-                f'<td class="num cell {act_class(v)} {tier}" '
+                f'<td class="num cell {act_class(v)} {tier}{" drill" if gap else ""}"{drill} '
                 f'title="{c["LAUNCHED"]} launched / {c["ASSIGNED"]} assigned · '
-                f'{c["STILL_OPEN"]} open · {c["CANCELED"]} canceled">'
+                f'{c["STILL_OPEN"]} open · {c["CANCELED"]} canceled'
+                f'{" — click for the " + str(gap) + " that did not launch" if gap else ""}">'
                 f'{v:.0f}%<span class="sub">{c["LAUNCHED"]}/{c["ASSIGNED"]}</span></td>')
         tot = pct(r["launched_2026"], r["assigned_2026"])
         rows.append(f"""<tr data-pod="{slug(r['manager'])}">
-  <td class="name">{r['rep']}<span class="sub">{r['manager']}</span></td>
+  <td class="name drill" data-rep="{esc(r['rep'])}" data-month="ALL"
+      data-launched="{r['launched_2026']}" data-assigned="{r['assigned_2026']}"
+      title="Click for every case this rep has not launched">{r['rep']}<span class="sub">{r['manager']}</span></td>
   {''.join(cells)}
   <td class="num tot {act_class(tot)}">{fmt_pct(tot)}<span class="sub">{r['launched_2026']}/{r['assigned_2026']}</span></td>
 </tr>""")
@@ -327,6 +372,12 @@ def render(reps, generated):
                       if m in BOUNTY_ACT_MONTHS)
     bounty_act = pct(ba_launched, ba_assigned)
 
+    # Drill-down payload. "</" is split so an account name can never close the script tag.
+    detail_json = json.dumps(case_detail_payload(), separators=(",", ":")).replace("</", "<\\/")
+    full_month = {"pre-2026": "Pre-2026 cohorts",
+                  **{m: f"{MONTH_LABEL[m]} 2026" for m in MONTHS}}
+    month_json = json.dumps(full_month, separators=(",", ":"))
+
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -355,10 +406,10 @@ body {{ margin:0; background:var(--warm-cream); color:var(--near-black);
   border-radius:50%; background:radial-gradient(circle,rgba(255,255,255,.16),transparent 62%); }}
 .hero-in {{ max-width:1360px; margin:0 auto; display:flex; justify-content:space-between;
   align-items:flex-end; gap:28px; flex-wrap:wrap; position:relative; z-index:1; }}
-.brandmark {{ display:flex; align-items:center; gap:11px; font-weight:700; font-size:19px;
-  letter-spacing:-0.4px; opacity:.95; margin-bottom:18px; }}
-.brandmark .star {{ width:26px; height:26px; background:var(--white); color:var(--owner-green);
-  border-radius:8px; display:grid; place-items:center; font-size:16px; }}
+.brandmark {{ display:flex; align-items:center; gap:10px; font-weight:700; font-size:21px;
+  letter-spacing:-0.5px; margin-bottom:18px; }}
+.brandmark svg {{ width:30px; height:30px; display:block; flex:none; }}
+.brandmark .sub {{ font-weight:350; opacity:.7; }}
 h1 {{ font-size:58px; font-weight:700; letter-spacing:-1.3px; line-height:1.05; margin:0; }}
 .hero .lede {{ font-size:19px; opacity:.9; margin-top:12px; max-width:640px; font-weight:350; }}
 .counter {{ text-align:right; background:rgba(255,255,255,.13); border:1px solid rgba(255,255,255,.24);
@@ -422,6 +473,47 @@ table.tbl tbody tr:last-child td {{ border-bottom:none; }}
 
 /* ---- matrix ---- */
 table.matrix td.cell {{ font-weight:600; }}
+table.matrix td.drill {{ cursor:pointer; position:relative; }}
+table.matrix td.drill:hover {{ outline:2px solid var(--owner-green); outline-offset:-2px; }}
+table.matrix td.num.drill::after {{ content:""; position:absolute; right:3px; bottom:3px;
+  border:3.5px solid transparent; border-right-color:currentColor; border-bottom-color:currentColor;
+  opacity:.5; }}
+table.matrix td.name.drill:hover {{ color:var(--owner-green); }}
+
+/* ---- drill-down modal ---- */
+.modal {{ position:fixed; inset:0; background:rgba(20,28,20,.55); backdrop-filter:blur(3px);
+  display:none; align-items:flex-start; justify-content:center; padding:48px 20px; z-index:50; }}
+.modal.open {{ display:flex; }}
+.sheet {{ background:var(--warm-cream); border-radius:26px; max-width:1080px; width:100%;
+  max-height:88vh; display:flex; flex-direction:column; overflow:hidden;
+  box-shadow:0 24px 70px rgba(0,0,0,.32); }}
+.sheet-hd {{ padding:26px 30px 20px; border-bottom:1px solid var(--warm-gray);
+  background:var(--white); }}
+.sheet-hd h3 {{ margin:0; font-size:27px; font-weight:700; letter-spacing:-0.7px; }}
+.sheet-hd .meta {{ margin-top:7px; font-size:16px; color:#6b655e; }}
+.sheet-x {{ position:absolute; right:26px; top:22px; border:0; background:var(--warm-beige);
+  width:36px; height:36px; border-radius:50%; font-size:19px; cursor:pointer; color:#6b655e; }}
+.sheet-x:hover {{ background:var(--warm-gray); }}
+.pills {{ display:flex; flex-wrap:wrap; gap:8px; margin-top:15px; }}
+.pill {{ font-size:13.5px; font-weight:600; padding:5px 13px; border-radius:999px;
+  background:var(--warm-beige); letter-spacing:-0.2px; }}
+.pill.open {{ background:rgba(8,137,36,.13); color:#07691c; }}
+.pill.cancel {{ background:rgba(179,64,47,.13); color:#8f3325; }}
+.pill.closed {{ background:rgba(116,108,207,.14); color:#4f47a8; }}
+.sheet-bd {{ overflow-y:auto; padding:6px 30px 28px; }}
+.sheet-bd table {{ width:100%; border-collapse:collapse; font-size:15.5px; }}
+.sheet-bd th {{ text-align:left; font-size:12.5px; text-transform:uppercase; letter-spacing:.6px;
+  color:#8a837b; padding:14px 10px 8px; position:sticky; top:0; background:var(--warm-cream); }}
+.sheet-bd td {{ padding:10px; border-top:1px solid var(--warm-gray); vertical-align:top; }}
+.sheet-bd tr.grp td {{ background:var(--warm-beige); font-weight:700; font-size:13px;
+  text-transform:uppercase; letter-spacing:.6px; color:#5d5852; padding:9px 10px; }}
+.tag {{ display:inline-block; font-size:12.5px; font-weight:600; padding:3px 9px;
+  border-radius:7px; background:var(--warm-beige); white-space:nowrap; }}
+.tag.bts {{ background:rgba(179,64,47,.15); color:#8f3325; }}
+.tag.hold {{ background:rgba(221,173,107,.3); color:#7a5518; }}
+.tag.live {{ background:rgba(8,137,36,.14); color:#07691c; }}
+.bty {{ font-weight:700; color:#07691c; }}
+.none {{ color:#a8a19a; }}
 table.matrix th.t40, table.matrix td.t40 {{ background:rgba(221,173,107,.16); }}
 table.matrix th.t20, table.matrix td.t20 {{ background:rgba(86,174,221,.14); }}
 table.matrix td.tot {{ border-left:2px solid var(--warm-gray); font-weight:700; }}
@@ -450,7 +542,13 @@ code {{ background:var(--warm-beige); padding:2px 7px; border-radius:6px; font-s
 
 <div class="hero"><div class="hero-in">
   <div>
-    <div class="brandmark"><span class="star">&#9733;</span> Owner · Launch</div>
+    <div class="brandmark">
+      <svg viewBox="0 0 30 30" role="img" aria-label="Owner">
+        <circle cx="15" cy="15" r="15" fill="#FFFFFF"/>
+        <rect x="7" y="7" width="16" height="16" rx="3.4"
+              transform="rotate(45 15 15)" fill="#094413"/>
+      </svg>
+      <span>Owner</span><span class="sub">· Launch</span></div>
     <h1>Backlog Bounty</h1>
     <div class="lede">Every aged case launched in August pays out — and every one left open
       on the 31st gets churned. Here's where the money and the risk are sitting.</div>
@@ -495,7 +593,9 @@ code {{ background:var(--warm-beige); padding:2px 7px; border-radius:6px; font-s
 <h2>Activation rate by <span class="em">assignment month</span></h2>
 <p class="deck">Of the cases assigned to a rep in a given month, how many have launched as of today.
   Cases still open, canceled, or DQ'd all stay in the denominator. Shaded columns carry a bounty:
-  <b>gold = $40</b> (Mar &amp; older), <b>blue = $20</b> (Apr–May). Hover a cell for the split.</p>
+  <b>gold = $40</b> (Mar &amp; older), <b>blue = $20</b> (Apr–May).
+  <b>Click any cell</b> to see the cases that didn't launch and what state they're in —
+  or click a rep's name for every month at once.</p>
 {pod_tabs(order)}
 <div class="card">{activation_matrix(scoped)}</div>
 <div class="legend">
@@ -527,6 +627,114 @@ code {{ background:var(--warm-beige); padding:2px 7px; border-radius:6px; font-s
   Refresh anytime: <code>python3 backlog-bounty/build_dashboard.py</code>
 </footer>
 </div>
+
+<div class="modal" id="modal"><div class="sheet" style="position:relative">
+  <button class="sheet-x" id="sheetX" aria-label="Close">&times;</button>
+  <div class="sheet-hd"><h3 id="sheetT"></h3><div class="meta" id="sheetM"></div>
+    <div class="pills" id="sheetP"></div></div>
+  <div class="sheet-bd" id="sheetB"></div>
+</div></div>
+
+<script>
+var DETAIL = {detail_json};
+var MONTHNAME = {month_json};
+
+(function () {{
+  var modal = document.getElementById('modal');
+  var T = document.getElementById('sheetT'), M = document.getElementById('sheetM');
+  var P = document.getElementById('sheetP'), B = document.getElementById('sheetB');
+
+  function esc(s) {{
+    return String(s == null ? '' : s).replace(/[&<>"]/g, function (c) {{
+      return {{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}}[c];
+    }});
+  }}
+  function statusTag(s) {{
+    var k = s === 'Back to Sales' ? 'bts'
+          : s === 'On Hold' ? 'hold'
+          : (s === 'First Order Completed' || s === 'Second Order Completed') ? 'live' : '';
+    return '<span class="tag ' + k + '">' + esc(s) + '</span>';
+  }}
+
+  function open(rep, month, launched, assigned) {{
+    var rows = [], label;
+    if (month === 'ALL') {{
+      Object.keys(DETAIL).forEach(function (k) {{
+        if (k.slice(0, rep.length + 1) === rep + '|') {{
+          DETAIL[k].forEach(function (r) {{
+            var c = k.split('|')[1];
+            rows.push(Object.assign({{ m: c }}, r));
+          }});
+        }}
+      }});
+      // Newest cohort first when showing every month together.
+      rows.sort(function (a, b) {{ return a.m < b.m ? 1 : a.m > b.m ? -1 : 0; }});
+      label = 'All 2026 cohorts';
+    }} else {{
+      rows = (DETAIL[rep + '|' + month] || []).slice();
+      label = MONTHNAME[month] || month;
+    }}
+
+    var nOpen = 0, nCancel = 0, nClosed = 0, money = 0;
+    rows.forEach(function (r) {{
+      if (r.d === 'Open') {{ nOpen++; money += r.b; }}
+      else if (r.d === 'Canceled') nCancel++;
+      else nClosed++;
+    }});
+
+    T.textContent = rep + ' · ' + label;
+    var rate = assigned ? Math.round(1000 * launched / assigned) / 10 : 0;
+    M.innerHTML = '<b>' + launched + ' of ' + assigned + '</b> launched (' + rate + '%) · '
+      + '<b>' + rows.length + '</b> did not launch';
+
+    var pills = ['<span class="pill open">' + nOpen + ' still open</span>',
+                 '<span class="pill cancel">' + nCancel + ' canceled</span>',
+                 '<span class="pill closed">' + nClosed + ' closed, not launched</span>'];
+    if (money) pills.push('<span class="pill">$' + money + ' still winnable</span>');
+    P.innerHTML = pills.join('');
+
+    if (!rows.length) {{
+      B.innerHTML = '<p class="none" style="padding:24px 0">Every case in this cohort launched.</p>';
+    }} else {{
+      var body = '', seen = '';
+      rows.forEach(function (r) {{
+        if (r.d !== seen) {{
+          seen = r.d;
+          body += '<tr class="grp"><td colspan="6">' + esc(seen) + '</td></tr>';
+        }}
+        body += '<tr>'
+          + '<td>' + esc(r.a) + '<div class="sub" style="color:#8a837b;font-size:13px">'
+              + esc(r.n) + (month === 'ALL' ? ' · ' + esc(MONTHNAME[r.m] || r.m) : '') + '</div></td>'
+          + '<td>' + statusTag(r.s) + '</td>'
+          + '<td class="num">' + r.days + 'd</td>'
+          + '<td>' + (r.gl ? esc(r.gl) : '<span class="none">not scheduled</span>') + '</td>'
+          + '<td>' + (r.cf ? esc(r.cf) : '<span class="none">—</span>')
+              + (r.pr ? '<div class="sub" style="color:#8a837b;font-size:13px">' + esc(r.pr) + '</div>' : '')
+          + '</td>'
+          + '<td class="num">' + (r.b ? '<span class="bty">$' + r.b + '</span>' : '<span class="none">—</span>') + '</td>'
+          + '</tr>';
+      }});
+      B.innerHTML = '<table><thead><tr><th>Account</th><th>Status</th><th class="num">Age</th>'
+        + '<th>Go-live scheduled</th><th>Confidence</th><th class="num">Bounty</th></tr></thead>'
+        + '<tbody>' + body + '</tbody></table>';
+    }}
+    modal.classList.add('open');
+  }}
+
+  document.addEventListener('click', function (e) {{
+    var td = e.target.closest('td.drill');
+    if (td) {{
+      open(td.dataset.rep, td.dataset.month,
+           +td.dataset.launched, +td.dataset.assigned);
+      return;
+    }}
+    if (e.target.closest('#sheetX') || e.target === modal) modal.classList.remove('open');
+  }});
+  document.addEventListener('keydown', function (e) {{
+    if (e.key === 'Escape') modal.classList.remove('open');
+  }});
+}}());
+</script>
 
 <script>
 document.querySelectorAll('.tabs').forEach(function (bar) {{
