@@ -14,6 +14,7 @@ import datetime as dt
 from pathlib import Path
 from collections import defaultdict
 import html as html_lib
+import shutil
 
 ROOT = Path(__file__).resolve().parent
 DATA = ROOT / "data"
@@ -51,7 +52,26 @@ POD_DIRECTOR = {
 BRIAN_PODS = [p for p, d in POD_DIRECTOR.items() if d == "Brian Marzo"]
 
 
+SNOW_MISSING = """
+The `snow` CLI isn't on PATH, so no data could be pulled.
+
+This happens when the Claude session's PATH rotates and takes a session-scoped
+install with it. Reinstall it (idempotent, uses the bundled read-only key —
+no interactive login):
+
+  brew install snowflake-cli
+  bash "$(find ~/Library/Application\\ Support/Claude -name setup_snowflake_cli.sh \\
+       2>/dev/null | head -1)"
+
+Then re-run this script. To rebuild the page from the last good pull instead:
+
+  python3 build_dashboard.py --no-refresh
+"""
+
+
 def run_queries():
+    if shutil.which("snow") is None:
+        raise SystemExit(SNOW_MISSING)
     DATA.mkdir(exist_ok=True)
     for name in QUERY_NAMES:
         out = subprocess.run(
