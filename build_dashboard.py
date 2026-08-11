@@ -126,9 +126,13 @@ def build_model():
         return reps[name]
 
     # Seed from the live roster FIRST so every active rep gets a row even at $0.
-    # Anyone who only shows up in the case data is a departed owner — still counted,
-    # but flagged, because their open cases are real churn liability.
-    for u in load("roster"):
+    roster = load("roster")
+    if len(roster) < 20:
+        # Guard: the roster drives who appears at all. An empty or truncated result
+        # would silently blank the dashboard rather than fail, so stop instead.
+        raise SystemExit(f"Roster query returned only {len(roster)} reps — refusing to "
+                         f"build a dashboard that would drop everyone. Check queries/roster.sql.")
+    for u in roster:
         slot(u["REP"], u["MANAGER"], u["TITLE"])["on_roster"] = True
 
     for c in cases:
@@ -160,7 +164,15 @@ def build_model():
             r["assigned_2026"] += c["ASSIGNED"]
             r["launched_2026"] += c["LAUNCHED"]
 
-    return list(reps.values())
+    # Departed reps are out of scope entirely (Brian, 2026-08-11) — not shown, and not
+    # counted in any pod or org total. They hold no aged-open cases and no August
+    # launches, so nothing real leaves with them.
+    return [r for r in reps.values() if r["on_roster"]]
+
+
+def active_reps():
+    """Names on the current roster. Anything else is a departed owner and is dropped."""
+    return {u["REP"] for u in load("roster")}
 
 
 def case_detail_payload():
@@ -169,9 +181,10 @@ def case_detail_payload():
     Only the seven participating pods are embedded — the query returns the whole org,
     and shipping the rest would bloat the page with rows no cell can ever open.
     """
+    active = active_reps()
     detail = defaultdict(list)
     for c in load("cohort_case_detail"):
-        if c["MANAGER"] not in POD_DIRECTOR:
+        if c["MANAGER"] not in POD_DIRECTOR or c["REP"] not in active:
             continue
         detail[f'{c["REP"]}|{c["COHORT_MONTH"]}'].append({
             "n": c["CASE_NUMBER"],
@@ -198,10 +211,11 @@ def bounty_detail_payload():
     Managers asked to see the actual cases behind every number, not just the totals —
     which ones paid out, and exactly which aged cases are still sitting there.
     """
+    active = active_reps()
     detail = defaultdict(list)
 
     for c in load("bounty_cases"):
-        if c["MANAGER"] not in POD_DIRECTOR or not c["BOUNTY_USD"]:
+        if c["MANAGER"] not in POD_DIRECTOR or c["REP"] not in active or not c["BOUNTY_USD"]:
             continue
         detail[f'{c["REP"]}|earned'].append({
             "n": c["CASE_NUMBER"], "a": c["ACCOUNT_NAME"] or "—",
@@ -211,7 +225,7 @@ def bounty_detail_payload():
 
     for c in load("open_backlog"):
         b = c["BOUNTY_IF_LAUNCHED"]
-        if c["MANAGER"] not in POD_DIRECTOR or b not in (20, 40):
+        if c["MANAGER"] not in POD_DIRECTOR or c["REP"] not in active or b not in (20, 40):
             continue
         detail[f'{c["REP"]}|{"gold" if b == 40 else "silver"}'].append({
             "n": c["CASE_NUMBER"], "a": c["ACCOUNT_NAME"] or "—",
@@ -320,9 +334,8 @@ def target_list(reps):
             cell = f'<td class="num muted">n/a<span class="sub">{l}/{a} assigned</span></td>'
         else:
             cell = f'<td class="num {act_class(ba)}">{fmt_pct(ba)}<span class="sub">{l}/{a}</span></td>'
-        gone = "" if r.get("on_roster") else '<span class="gone" title="Owns cases but is not on the active roster — someone has to absorb these">departed</span>'
         rows.append(f"""<tr data-pod="{slug(r['manager'])}">
-  <td class="name">{r['rep']}{gone}<span class="sub">{r['manager']}</span></td>
+  <td class="name">{r['rep']}<span class="sub">{r['manager']}</span></td>
   <td class="num">{bchip(r, 'gold', 'chip-gold', r['open_gold'])}</td>
   <td class="num">{bchip(r, 'silver', 'chip-blue', r['open_silver'])}</td>
   <td class="num money-open big">{money(r['available'])}</td>
@@ -363,10 +376,9 @@ def leaderboard(reps):
     rows = []
     for i, r in enumerate(ranked):
         medal = {0: "\U0001f947", 1: "\U0001f948", 2: "\U0001f949"}.get(i, "") if r["earned"] else ""
-        gone = "" if r.get("on_roster") else '<span class="gone">departed</span>'
         rows.append(f"""<tr data-pod="{slug(r['manager'])}">
   <td class="rank">{medal or i+1}</td>
-  <td class="name">{r['rep']}{gone}<span class="sub">{r['manager']}</span></td>
+  <td class="name">{r['rep']}<span class="sub">{r['manager']}</span></td>
   <td class="num">{r['aug_launches']}</td>
   <td class="num">{bchip(r, 'earned', 'chip-gold', r['gold'])}</td>
   <td class="num">{bchip(r, 'earned', 'chip-blue', r['silver'])}</td>
@@ -604,10 +616,6 @@ table.matrix td.name.drill:hover {{ color:var(--owner-green); }}
 /* clickable money / chip cells in the rep tables */
 .bd {{ cursor:pointer; display:inline-block; border-bottom:1.5px dotted rgba(8,137,36,.5); }}
 .bd:hover {{ border-bottom-color:var(--owner-green); transform:translateY(-1px); }}
-.gone {{ display:inline-block; margin-left:7px; font-size:11px; font-weight:700;
-  text-transform:uppercase; letter-spacing:.5px; padding:2px 7px; border-radius:6px;
-  background:rgba(179,64,47,.14); color:#8f3325; vertical-align:middle; }}
-table.matrix th.t40, table.matrix td.t40 {{ background:rgba(221,173,107,.16); }}
 table.matrix th.t20, table.matrix td.t20 {{ background:rgba(86,174,221,.14); }}
 table.matrix td.tot {{ border-left:2px solid var(--warm-gray); font-weight:700; }}
 
