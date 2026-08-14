@@ -1,3 +1,6 @@
-# Raw Snowflake pulls — contain customer account names and case numbers.
-# The dashboard HTML is aggregate-only and safe to publish; these are not.
+# Raw Snowflake pulls — kept local; the published HTML is built from them.
+# NOTE: the dashboard HTML is NOT aggregate-only. Since the 8/10 drill-down it embeds
+# customer account names for the case-detail modals. Brian was shown that exposure and
+# chose to publish as-is; this file is ignored to keep the raw JSON out of the repo, not
+# because the HTML is anonymous.
 data/

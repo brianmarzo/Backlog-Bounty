@@ -21,7 +21,7 @@ DATA = ROOT / "data"
 QUERIES = ROOT / "queries"
 
 QUERY_NAMES = ("bounty_cases", "open_backlog", "cohort_activation", "cohort_case_detail",
-               "roster")
+               "roster", "decisions")
 
 BOUNTY_END = dt.date(2026, 8, 31)
 
@@ -86,7 +86,10 @@ def run_queries():
 
 # Snowflake's JSON output serializes numeric columns as strings.
 INT_COLS = ("BOUNTY_USD", "BOUNTY_IF_LAUNCHED", "ASSIGNED", "LAUNCHED", "STILL_OPEN",
-            "CANCELED", "CLOSED_OTHER", "DAYS_IN_ONBOARDING", "DAYS_OPEN")
+            "CANCELED", "CLOSED_OTHER", "DAYS_IN_ONBOARDING", "DAYS_OPEN",
+            "AGED_BACKLOG_AUG1", "CHURNED", "DQD", "CANCELED_OTHER", "DECISIONS",
+            "BOUNTY_EARNED", "BOUNTY_LEFT",
+            "DEC_W1", "DEC_W2", "DEC_W3", "DEC_W4", "DAYS_SINCE_DECISION")
 # Drill-down statuses, ordered worst-to-best so the modal leads with what needs work.
 STATUS_ORDER = ["Back to Sales", "On Hold", "New", "Launch Accepted",
                 "First Order Completed", "Second Order Completed"]
@@ -122,6 +125,10 @@ def build_model():
                 "open_gold": 0, "open_silver": 0, "available": 0, "churn_risk": 0,
                 "cohort": {}, "assigned_2026": 0, "launched_2026": 0,
                 "open_by_month": defaultdict(int), "on_roster": False,
+                # Pipeline-hygiene ("decisions") counters — see queries/decisions.sql.
+                "aged_aug1": 0, "d_launched": 0, "d_churned": 0, "d_dqd": 0,
+                "d_other": 0, "decisions": 0,
+                "d_w1": 0, "d_w2": 0, "d_w3": 0, "d_w4": 0, "last_decision": None,
             }
         return reps[name]
 
@@ -163,6 +170,23 @@ def build_model():
         if c["COHORT_MONTH"] != "pre-2026":
             r["assigned_2026"] += c["ASSIGNED"]
             r["launched_2026"] += c["LAUNCHED"]
+
+    # Decisions: is the pipeline actually getting cleared? Launch, DQ, and churn all count
+    # equally as good outcomes (Brian, 2026-08-14) — the only bad bucket is "still open."
+    # Weekly counts drive the swoop-cadence read.
+    for c in load("decisions"):
+        r = slot(c["REP"], c["MANAGER"], c["TITLE"])
+        r["aged_aug1"] += c["AGED_BACKLOG_AUG1"]
+        r["d_launched"] += c["LAUNCHED"]
+        r["d_churned"] += c["CHURNED"]
+        r["d_dqd"] += c["DQD"]
+        r["d_other"] += c["CANCELED_OTHER"]
+        r["decisions"] += c["DECISIONS"]
+        for i in (1, 2, 3, 4):
+            r[f"d_w{i}"] += c[f"DEC_W{i}"]
+        if c.get("LAST_DECISION_ON"):
+            prev = r["last_decision"]
+            r["last_decision"] = max(prev, c["LAST_DECISION_ON"]) if prev else c["LAST_DECISION_ON"]
 
     # Departed reps are out of scope entirely (Brian, 2026-08-11) — not shown, and not
     # counted in any pod or org total. They hold no aged-open cases and no August
@@ -247,14 +271,22 @@ def pod_rollup(reps):
         "earned": 0, "available": 0, "gold": 0, "silver": 0, "churn_risk": 0,
         "open_gold": 0, "open_silver": 0, "aug_launches": 0,
         "assigned_2026": 0, "launched_2026": 0, "reps": [],
+        "aged_aug1": 0, "d_launched": 0, "d_churned": 0, "d_dqd": 0,
+        "d_other": 0, "decisions": 0,
+        "d_w1": 0, "d_w2": 0, "d_w3": 0, "d_w4": 0, "last_decision": None,
         "cohort": defaultdict(lambda: {"ASSIGNED": 0, "LAUNCHED": 0}),
     })
     for r in reps:
         p = pods[r["manager"]]
         for k in ("earned", "available", "gold", "silver", "churn_risk",
                   "open_gold", "open_silver", "aug_launches",
-                  "assigned_2026", "launched_2026"):
+                  "assigned_2026", "launched_2026",
+                  "aged_aug1", "d_launched", "d_churned", "d_dqd",
+                  "d_other", "decisions", "d_w1", "d_w2", "d_w3", "d_w4"):
             p[k] += r[k]
+        if r["last_decision"]:
+            p["last_decision"] = (max(p["last_decision"], r["last_decision"])
+                                  if p["last_decision"] else r["last_decision"])
         p["reps"].append(r)
         for m, c in r["cohort"].items():
             p["cohort"][m]["ASSIGNED"] += c["ASSIGNED"]
@@ -315,6 +347,132 @@ def pod_standings(pods, order):
 
 def fmt_pct(v):
     return f"{v:.0f}%" if v is not None else "—"
+
+
+def mixcell(r):
+    """Neutral launch / churn / DQ split. All three are good outcomes — a decision is a
+    decision (Brian, 2026-08-14). Deliberately NOT colour-coded against each other."""
+    return (f'<span class="chip chip-green">{r["d_launched"]}</span> '
+            f'<span class="chip chip-plain">{r["d_churned"]}</span> '
+            f'<span class="chip chip-plain">{r["d_dqd"] + r["d_other"]}</span>')
+
+
+def touchcell(last, generated):
+    """Date of the most recent decision. Stated as a date + elapsed days, no characterization.
+
+    This page is published externally (Brian, 2026-08-14): report the measurement, never a
+    judgment about the person or their behavior.
+    """
+    if not last:
+        return '<td class="num muted">none in Aug<span class="sub">&mdash;</span></td>'
+    d = (generated - dt.date.fromisoformat(last[:10])).days
+    word = "today" if d == 0 else ("1 day ago" if d == 1 else f"{d} days ago")
+    return f'<td class="num">{word}<span class="sub">{last[:10]}</span></td>'
+
+
+def trendcell(p):
+    """Week-1 vs week-2 decision counts, as a signed delta. Deliberately unlabeled — earlier
+    versions read 'stalled' / 'slowing' / 'accelerating', which characterizes a pod rather than
+    reporting the number. The two counts and the delta say the same thing neutrally."""
+    w1, w2 = p["d_w1"], p["d_w2"]
+    delta = w2 - w1
+    sign = f"+{delta}" if delta > 0 else (str(delta) if delta < 0 else "no change")
+    return (f'<td class="num"><span class="wk">{w1}</span> &rarr; <span class="wk">{w2}</span>'
+            f'<span class="sub">{sign}</span></td>')
+
+
+def zero_decision_list(zero):
+    """Reps holding aged cases with no August decision, grouped by pod. Counts only — the
+    page is published externally, so no characterization of the rep or the pod."""
+    if not zero:
+        return ('<p class="empty">Every rep holding aged cases has at least one August '
+                'decision recorded.</p>')
+    by_pod = defaultdict(list)
+    for r in zero:
+        by_pod[r["manager"]].append(r)
+    blocks = []
+    for mgr in sorted(by_pod, key=lambda m: -sum(x["aged_aug1"] for x in by_pod[m])):
+        rs = by_pod[mgr]
+        tot = sum(x["aged_aug1"] for x in rs)
+        chips = " ".join(
+            f'<span class="zchip"><b>{r["aged_aug1"]}</b> {esc(r["rep"])}</span>' for r in rs)
+        blocks.append(f'<div class="zrow"><div class="zhead">{esc(mgr)}'
+                      f'<span class="sub">{len(rs)} rep{"s" if len(rs) != 1 else ""} · '
+                      f'{tot} case{"s" if tot != 1 else ""} with no decision</span></div>'
+                      f'<div class="zchips">{chips}</div></div>')
+    return "".join(blocks)
+
+
+def decisions_pods(pods, order, generated):
+    """Pod-level: is this manager clearing aged inventory, and are they still at it?
+
+    Ranked by decision rate, NOT by dollars — the money board already ranks by dollars and
+    hides managers who cleared inventory by DQ/churn instead of launching it.
+    """
+    rows = []
+    ranked = sorted([m for m in order if pods[m]["aged_aug1"]],
+                    key=lambda m: -(pods[m]["decisions"] / pods[m]["aged_aug1"]))
+    for i, mgr in enumerate(ranked):
+        p = pods[mgr]
+        base = p["aged_aug1"]
+        dec = pct(p["decisions"], base) or 0
+        rows.append(f"""<tr>
+  <td class="rank">{i+1}</td>
+  <td class="name">{mgr}<span class="sub">{len(p['reps'])} reps · {base} aged cases on 8/1</span></td>
+  <td class="num big">{p['decisions']}<span class="sub">of {base}</span></td>
+  <td class="num big">{dec:.0f}%</td>
+  {trendcell(p)}
+  {touchcell(p['last_decision'], generated)}
+  <td class="num">{mixcell(p)}</td>
+  <td class="num big">{base - p['decisions']}</td>
+  <td class="barcell"><div class="minibar"><div style="width:{dec:.1f}%"></div></div><span class="sub">decided</span></td>
+</tr>""")
+    return f"""<table class="tbl">
+<thead><tr><th>#</th><th>Pod</th><th class="num">Decisions</th><th class="num">Decision rate</th>
+<th class="num">Wk 1 &rarr; wk 2</th><th class="num">Last decision</th>
+<th class="num">Launch / churn / DQ</th><th class="num">No decision yet</th><th>Progress</th></tr></thead>
+<tbody>{''.join(rows)}</tbody></table>"""
+
+
+def decisions_reps(reps, generated):
+    """Rep-level decision table. Every rep with aged inventory on 8/1 appears.
+
+    Sorted so untouched pipelines surface: zero-decision reps first (biggest backlog first),
+    since those are the swoop targets, then everyone else by decision rate.
+    """
+    # Reps below the 8-case floor sort BELOW everyone with a real rate, regardless of their
+    # ratio. Sorting them purely by rate floated 2-aged-case reps to the top of the board —
+    # one of them (2 cases) read as the 2nd-best decision-maker in the org.
+    ranked = sorted([r for r in reps if r["aged_aug1"]],
+                    key=lambda r: (r["decisions"] > 0,
+                                   r["aged_aug1"] < 8,
+                                   -(r["decisions"] / r["aged_aug1"]),
+                                   -r["aged_aug1"], r["rep"]))
+    rows = []
+    for r in ranked:
+        base = r["aged_aug1"]
+        dec = pct(r["decisions"], base) or 0
+        if r["decisions"] == 0:
+            cell = f'<td class="num big">0%<span class="sub">0/{base}</span></td>'
+        elif base < 8:
+            # Below ~8 aged cases a rate is noise — show the raw split instead.
+            cell = f'<td class="num muted">n/a<span class="sub">{r["decisions"]}/{base}</span></td>'
+        else:
+            cell = f'<td class="num big">{dec:.0f}%<span class="sub">{r["decisions"]}/{base}</span></td>'
+        rows.append(f"""<tr data-pod="{slug(r['manager'])}">
+  <td class="name">{r['rep']}<span class="sub">{r['manager']}</span></td>
+  <td class="num">{base}</td>
+  <td class="num big">{r['decisions']}</td>
+  {cell}
+  {touchcell(r['last_decision'], generated)}
+  <td class="num">{mixcell(r)}</td>
+  <td class="num">{base - r['decisions']}</td>
+</tr>""")
+    return f"""<table class="tbl">
+<thead><tr><th>Rep</th><th class="num">Aged on 8/1</th><th class="num">Decisions</th>
+<th class="num">Decision rate</th><th class="num">Last decision</th>
+<th class="num">Launch / churn / DQ</th><th class="num">No decision yet</th></tr></thead>
+<tbody>{''.join(rows)}</tbody></table>"""
 
 
 def target_list(reps):
@@ -463,6 +621,22 @@ def render(reps, generated):
     b_assigned = sum(p["assigned_2026"] for m, p in pods.items() if m in live)
     b_launched = sum(p["launched_2026"] for m, p in pods.items() if m in live)
 
+    # Decision / swoop totals.
+    t_aged = sum(r["aged_aug1"] for r in scoped)
+    t_dec = sum(r["decisions"] for r in scoped)
+    t_churned = sum(r["d_churned"] for r in scoped)
+    t_dqd = sum(r["d_dqd"] for r in scoped)
+    t_other = sum(r["d_other"] for r in scoped)
+    t_dlaunched = sum(r["d_launched"] for r in scoped)
+    t_open_aged = t_aged - t_dec
+    t_dec_pct = pct(t_dec, t_aged) or 0
+    t_w1 = sum(r["d_w1"] for r in scoped)
+    t_w2 = sum(r["d_w2"] for r in scoped)
+    # Reps holding aged inventory who have made no decision at all — the swoop list.
+    t_zero = sorted([r for r in scoped if r["aged_aug1"] and not r["decisions"]],
+                    key=lambda r: (-r["aged_aug1"], r["rep"]))
+    t_zero_cases = sum(r["aged_aug1"] for r in t_zero)
+
     # Activation on the bounty months only — this is the number the 85% goal is about.
     ba_assigned = sum(c["ASSIGNED"] for r in scoped for m, c in r["cohort"].items()
                       if m in BOUNTY_ACT_MONTHS)
@@ -565,6 +739,31 @@ table.tbl tbody tr:last-child td {{ border-bottom:none; }}
   font-size:13px; font-weight:700; letter-spacing:0; }}
 .chip-gold {{ background:var(--gold); color:#4a3410; }}
 .chip-blue {{ background:var(--sky-blue); color:#04304f; }}
+/* Decision-mix chips: launch is green, churn/DQ are neutral. All three are good outcomes,
+   so churn and DQ deliberately share one flat style rather than competing colours. */
+.chip-green {{ background:var(--owner-green); color:#fff; }}
+.chip-plain {{ background:var(--warm-beige); color:#6b6660; }}
+/* Swoop-cadence week counts. */
+.wk {{ font-weight:700; font-size:16px; }}
+/* Headline stat strip for the decisions section. */
+.statline {{ display:flex; flex-wrap:wrap; gap:12px; margin:0 0 20px; }}
+.stat {{ flex:1 1 150px; background:var(--white); border:1px solid var(--warm-gray);
+  border-radius:20px; padding:16px 18px; }}
+.stat b {{ display:block; font-size:30px; font-weight:700; line-height:1.1;
+  color:var(--darkest-green); letter-spacing:-.02em; }}
+.stat span {{ display:block; font-size:13px; color:#6b6660; margin-top:4px; }}
+.stat.danger b {{ color:var(--alert); }}
+/* Zero-decision swoop list, grouped by pod. */
+.zrow {{ padding:14px 0; border-bottom:1px solid var(--warm-beige); }}
+.zrow:last-child {{ border-bottom:0; }}
+.zhead {{ font-weight:600; font-size:15px; margin-bottom:9px; }}
+.zchips {{ display:flex; flex-wrap:wrap; gap:7px; }}
+.zchip {{ display:inline-block; padding:5px 11px; border-radius:99px; font-size:13px;
+  background:var(--warm-beige); color:var(--near-black); }}
+/* Neutral, not red: this list names individual reps on a published page, so the count is
+   emphasized without colouring it as a failure. */
+.zchip b {{ color:var(--darkest-green); font-weight:700; margin-right:4px; }}
+.empty {{ color:#6b6660; font-size:15px; margin:0; }}
 .minibar {{ width:110px; height:9px; background:var(--warm-beige); border-radius:99px;
   overflow:hidden; display:inline-block; vertical-align:middle; }}
 .minibar > div {{ height:100%; background:var(--owner-green); border-radius:99px; }}
@@ -651,8 +850,8 @@ code {{ background:var(--warm-beige); padding:2px 7px; border-radius:6px; font-s
       </svg>
       <span>Owner</span><span class="sub">· Launch</span></div>
     <h1>Backlog Bounty</h1>
-    <div class="lede">Every aged case launched in August pays out — and every one left open
-      on the 31st gets churned. Here's where the money and the risk are sitting.</div>
+    <div class="lede">Every aged case launched in August pays out, and every one still open on the
+      31st is churned under the month-end rule. Current standings and remaining inventory.</div>
   </div>
   <div class="counter"><div class="n">{days_left}</div><div class="l">days left · closes Aug 31</div></div>
 </div></div>
@@ -679,10 +878,40 @@ code {{ background:var(--warm-beige); padding:2px 7px; border-radius:6px; font-s
 <p class="deck">Each frontline manager pod, ranked by total bounty in reach.</p>
 <div class="card">{pod_standings(pods, order)}</div>
 
-<h2>Who needs the <span class="em">most help</span></h2>
-<p class="deck">Ranked by the number of $40 cases still sitting open — these reps are carrying the
-  most aged inventory, so they're where a manager hour buys the most launches. Every case here is
-  simultaneously a payout and a churn liability.</p>
+<h2>Decisions on the <span class="em">aged backlog</span></h2>
+<p class="deck">The bounty pays on launches only, so this section sets the money aside and tracks
+  <b>decisions</b> instead. A decision is a <b>launch, a DQ, or a churn</b> — all three count the
+  same here, and all three clear the case from the pipeline. Baseline is the
+  <b>{t_aged:,}</b> aged cases (Jan–May cohorts) open on Aug 1.</p>
+<div class="statline">
+  <div class="stat"><b>{t_aged:,}</b><span>aged cases open Aug 1</span></div>
+  <div class="stat"><b>{t_dec:,}</b><span>decided ({t_dec_pct:.0f}%)</span></div>
+  <div class="stat"><b>{t_open_aged:,}</b><span>no decision yet</span></div>
+  <div class="stat"><b>{t_w1} &rarr; {t_w2}</b><span>decisions wk 1 &rarr; wk 2</span></div>
+</div>
+<p class="deck">Mix of the {t_dec} decisions: <b>{t_dlaunched}</b> launched,
+  <b>{t_churned}</b> churned, <b>{t_dqd + t_other}</b> DQ'd or canceled. Week 1 (Aug 1–7) recorded
+  {t_w1} decisions; week 2 (Aug 8–14) recorded {t_w2}. Every case with no decision by Aug 31 is
+  churned under the month-end rule.</p>
+<div class="card">{decisions_pods(pods, order, generated)}</div>
+
+<h2>Aged cases with <span class="em">no decision yet</span></h2>
+<p class="deck">{len(t_zero)} rep{'s' if len(t_zero) != 1 else ''} hold
+  <b>{t_zero_cases}</b> aged cases that have no decision recorded in August. Listed by pod, with
+  each rep's case count. All of these fall under the Aug 31 churn rule.</p>
+<div class="card">{zero_decision_list(t_zero)}</div>
+
+<h2>Decisions <span class="em">by rep</span></h2>
+<p class="deck">Sorted with no-decision reps first, then by decision rate. "Last decision" shows the
+  date of the most recent launch, DQ, or churn on an aged case. Reps with fewer than 8 aged cases
+  show the raw count instead of a rate, since a percentage on a small base moves too much to
+  compare.</p>
+{pod_tabs(order)}
+<div class="card">{decisions_reps(scoped, generated)}</div>
+
+<h2>Open aged inventory <span class="em">by rep</span></h2>
+<p class="deck">Ranked by the number of $40 cases still open. Each case here carries a bounty if it
+  launches by Aug 31 and falls under the month-end churn rule if it does not.</p>
 {pod_tabs(order)}
 <div class="card">{target_list(scoped)}</div>
 
