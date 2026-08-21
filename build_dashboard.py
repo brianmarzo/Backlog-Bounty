@@ -125,6 +125,7 @@ def build_model():
                 "open_gold": 0, "open_silver": 0, "available": 0, "churn_risk": 0,
                 "cohort": {}, "assigned_2026": 0, "launched_2026": 0,
                 "open_by_month": defaultdict(int), "on_roster": False,
+                "open_nogl_by_month": defaultdict(int), "open_ages": defaultdict(list),
                 # Pipeline-hygiene ("decisions") counters — see queries/decisions.sql.
                 "aged_aug1": 0, "d_launched": 0, "d_churned": 0, "d_dqd": 0,
                 "d_other": 0, "decisions": 0,
@@ -163,6 +164,10 @@ def build_model():
         r["churn_risk"] += 1
         month = c["COHORT_MONTH"] if c["COHORT_MONTH"] >= "2026-01" else "pre-2026"
         r["open_by_month"][month] += 1
+        if not c.get("GO_LIVE_SCHEDULED"):
+            r["open_nogl_by_month"][month] += 1
+        if c.get("DAYS_OPEN") is not None:
+            r["open_ages"][month].append(c["DAYS_OPEN"])
 
     for c in cohorts:
         r = slot(c["REP"], c["MANAGER"], c["TITLE"])
@@ -343,6 +348,93 @@ def pod_standings(pods, order):
 <th class="num">Open $40 / $20</th><th class="num">Churn risk</th>
 <th class="num">Activation<br><span class="sub">2026 cohorts</span></th><th>Progress</th></tr></thead>
 <tbody>{''.join(rows)}</tbody></table>"""
+
+
+# Cohort buckets for the remaining-inventory view: oldest first, newest last.
+INV_MONTHS = ["pre-2026", "2026-01", "2026-02", "2026-03", "2026-04", "2026-05"]
+INV_LABEL = {"pre-2026": "2025 &amp; earlier", "2026-01": "January", "2026-02": "February",
+             "2026-03": "March", "2026-04": "April", "2026-05": "May"}
+
+
+def cohort_inventory(reps):
+    """Remaining OPEN aged cases broken out by the month the case entered onboarding.
+
+    Answers "how much of the backlog is which vintage" — the $40 tiers are the old,
+    small cohorts; May alone is roughly half the remaining inventory.
+    """
+    counts, nogl, ages = defaultdict(int), defaultdict(int), defaultdict(list)
+    for r in reps:
+        for m, n in r["open_by_month"].items():
+            counts[m] += n
+        for m, n in r["open_nogl_by_month"].items():
+            nogl[m] += n
+        for m, lst in r["open_ages"].items():
+            ages[m].extend(lst)
+    total = sum(counts.values())
+    if not total:
+        return '<p class="deck">No aged cases still open in this view.</p>'
+    total_usd = sum(counts[m] * (40 if m in TIER_40 else 20) for m in counts)
+    total_nogl = sum(nogl.values())
+
+    rows = []
+    for m in INV_MONTHS:
+        n = counts.get(m, 0)
+        if not n:
+            continue
+        tier = 40 if m in TIER_40 else 20
+        cls = "chip-gold" if tier == 40 else "chip-blue"
+        a = sorted(ages.get(m, []))
+        med = a[len(a) // 2] if a else None
+        share = n / total * 100
+        ng = nogl.get(m, 0)
+        ng_pct = ng / n * 100
+        rows.append(f"""<tr>
+  <td class="name">{INV_LABEL[m]}<span class="sub">median {med} days open</span></td>
+  <td class="num"><b>{n}</b></td>
+  <td class="num"><span class="chip {cls}">${tier}</span></td>
+  <td class="num money-open">{money(n * tier)}</td>
+  <td class="num {'danger' if ng_pct >= 33 else ''}">{ng}<span class="sub">{ng_pct:.0f}% of cohort</span></td>
+  <td class="barcell"><div class="minibar"><div style="width:{share:.1f}%"></div></div><span class="sub">{share:.0f}% of backlog</span></td>
+</tr>""")
+    return f"""<table class="tbl">
+<thead><tr><th>Cohort month</th><th class="num">Open cases</th><th class="num">Tier</th>
+<th class="num">On the table</th><th class="num">No go-live set</th><th>Share of remaining</th></tr></thead>
+<tbody>{''.join(rows)}</tbody>
+<tfoot><tr><td class="name"><b>Total</b></td><td class="num"><b>{total}</b></td><td></td>
+<td class="num money-open"><b>{money(total_usd)}</b></td>
+<td class="num"><b>{total_nogl}</b></td><td></td></tr></tfoot></table>"""
+
+
+def cohort_by_pod(reps, order):
+    """Same remaining-inventory cut, but pod x cohort month, so each manager can see
+    which vintage their own sitting cases are."""
+    grid = defaultdict(lambda: defaultdict(int))
+    for r in reps:
+        for m, n in r["open_by_month"].items():
+            grid[r["manager"]][m] += n
+    live = [m for m in INV_MONTHS if any(grid[p].get(m) for p in order)]
+    if not live:
+        return ""
+    head = "".join(
+        f'<th class="num {"t40" if m in TIER_40 else "t20"}">{INV_LABEL[m]}</th>' for m in live)
+    rows = []
+    for mgr in sorted(order, key=lambda m: -sum(grid[m].values())):
+        cells = []
+        for m in live:
+            n = grid[mgr].get(m, 0)
+            cls = "t40" if m in TIER_40 else "t20"
+            cells.append(f'<td class="num {cls}">{n or "—"}</td>')
+        tot = sum(grid[mgr].values())
+        star = " \u2b50" if mgr in BRIAN_PODS else ""
+        rows.append(f'<tr><td class="name">{mgr}{star}</td>{"".join(cells)}'
+                    f'<td class="num"><b>{tot or "—"}</b></td></tr>')
+    tots = "".join(
+        f'<td class="num"><b>{sum(grid[p].get(m, 0) for p in order)}</b></td>' for m in live)
+    grand = sum(sum(grid[p].values()) for p in order)
+    return f"""<table class="tbl matrix">
+<thead><tr><th>Pod</th>{head}<th class="num">Total</th></tr></thead>
+<tbody>{''.join(rows)}</tbody>
+<tfoot><tr><td class="name"><b>Total</b></td>{tots}<td class="num"><b>{grand}</b></td></tr></tfoot></table>"""
 
 
 def fmt_pct(v):
@@ -815,7 +907,10 @@ table.matrix td.name.drill:hover {{ color:var(--owner-green); }}
 /* clickable money / chip cells in the rep tables */
 .bd {{ cursor:pointer; display:inline-block; border-bottom:1.5px dotted rgba(8,137,36,.5); }}
 .bd:hover {{ border-bottom-color:var(--owner-green); transform:translateY(-1px); }}
+table.matrix th.t40, table.matrix td.t40 {{ background:rgba(221,173,107,.18); }}
 table.matrix th.t20, table.matrix td.t20 {{ background:rgba(86,174,221,.14); }}
+table.tbl tfoot td {{ border-top:2px solid var(--warm-gray); padding-top:12px;
+  font-weight:700; color:var(--ink); }}
 table.matrix td.tot {{ border-left:2px solid var(--warm-gray); font-weight:700; }}
 
 /* ---- tabs ---- */
@@ -908,6 +1003,14 @@ code {{ background:var(--warm-beige); padding:2px 7px; border-radius:6px; font-s
   compare.</p>
 {pod_tabs(order)}
 <div class="card">{decisions_reps(scoped, generated)}</div>
+
+<h2>Remaining open cases <span class="em">by cohort month</span></h2>
+<p class="deck">Every aged case still sitting in onboarding, grouped by the month it entered.
+  <b>Gold = $40</b> (Mar &amp; older), <b>blue = $20</b> (Apr–May). Each of these is both a payout
+  if it launches by Aug 31 and a forced churn if it doesn't, so this is the shape of the
+  month-end cliff.</p>
+<div class="card">{cohort_inventory(scoped)}</div>
+<div class="card" style="margin-top:16px">{cohort_by_pod(scoped, order)}</div>
 
 <h2>Open aged inventory <span class="em">by rep</span></h2>
 <p class="deck">Ranked by the number of $40 cases still open. Each case here carries a bounty if it
